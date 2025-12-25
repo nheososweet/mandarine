@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     DB_POOL_TIMEOUT: int = 30
     DB_POOL_RECYCLE: int = 3600
     DB_ECHO_SQL: bool = False
+
+    VECTOR_DB_PATH: str = "./chroma_db_store"
+
+    API_V1_STR: str = "/api/v1"
     
     # =============================================================================
     # SECURITY
@@ -51,6 +55,9 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "your-super-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    LLM_BASE_URL: str = ""
+    GEMINI_API_KEY: str = ""
     
     # =============================================================================
     # CORS
