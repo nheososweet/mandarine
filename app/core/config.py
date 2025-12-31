@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = ""
     GEMINI_API_KEY: str = ""
     
+    RETRIEVAL_K: int = 10  # Default number of documents to retrieve
+    RETRIEVAL_K_SOURCES: int = 3  # For get_sources() endpoint
+    CHUNK_SIZE: int = 1000
+    CHUNK_OVERLAP: int = 200
+    
     # =============================================================================
     # CORS
     # =============================================================================

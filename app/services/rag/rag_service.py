@@ -22,6 +22,7 @@ from app.core.exceptions import (
     VectorDBError, 
     BadRequestException
 )
+from app.core.prompt.prompts import RAG_SYSTEM_PROMPT, build_full_prompt
 
 # Setup Logger
 logger = logging.getLogger(__name__)
@@ -108,8 +109,8 @@ class RagService:
 
             # Split Text (Vietnamese Context Optimized)
             text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
+                chunk_size=settings.CHUNK_SIZE,
+                chunk_overlap=settings.CHUNK_OVERLAP,
                 separators=["\n\n", "\n", ".", " ", ""]
             )
             chunks = text_splitter.split_documents(documents)
@@ -136,114 +137,102 @@ class RagService:
 
     # async def query_rag_stream(self, question: str) -> AsyncGenerator[str, None]:
     #     """
-    #     Logic RAG viết theo kiểu tuần tự từng bước (Step-by-step).
-    #     Dễ debug, dễ hiểu luồng dữ liệu.
+    #     Stream response với trích dẫn nguồn - yield NGUYÊN BẢN từ LLM
     #     """
     #     try:
-    #         # BƯỚC 1: RETRIEVAL (Tìm kiếm dữ liệu)
-    #         logger.info(f"--- [STEP 1] Searching for: {question} ---")
+    #         # STEP 1: Retrieval - Tìm tài liệu liên quan
+    #         logger.info(f"Searching for: {question}")
+    #         retriever = self.vector_db.as_retriever(search_kwargs={"k": 10})  # Tăng lên 6 để tìm nhiều hơn
+    #         docs = retriever.invoke(question)
             
-    #         retriever = self.vector_db.as_retriever(search_kwargs={"k": 4})
-    #         # Gọi hàm invoke trực tiếp để lấy list documents về biến 'docs'
-    #         docs = retriever.invoke(question) 
+    #         # DEBUG: Log các docs đã tìm thấy
+    #         logger.info(f"Found {len(docs)} documents")
+    #         for i, doc in enumerate(docs, 1):
+    #             preview = doc.page_content[:100].replace('\n', ' ')
+    #             logger.info(f"Doc {i}: {os.path.basename(doc.metadata.get('source', 'unknown'))} - Page {doc.metadata.get('page', 'N/A')} - Preview: {preview}...")
             
-    #         # ---> DEBUG: Tại đây bạn có thể log thoải mái <---
-    #         logger.info(f"Found {len(docs)} documents.")
-    #         for i, doc in enumerate(docs):
-    #             logger.info(f"Doc {i+1}: {doc.metadata.get('source')} - {doc.page_content}")
-
-    #         # BƯỚC 2: CONTEXT PREPARATION (Chuẩn bị dữ liệu ghép vào prompt)
-    #         # Nối nội dung các trang tìm được thành 1 chuỗi văn bản dài
-    #         context_text = "\n\n".join([doc.page_content for doc in docs])
+    #         # STEP 2: Build Prompt với citations (sử dụng prompt từ file prompts.py)
+    #         user_prompt = build_full_prompt(question, docs)
             
-    #         # ---> DEBUG: Xem context gộp lại trông thế nào
-    #         # logger.info(f"Full Context: {context_text[:200]}...")
-
-    #         # BƯỚC 3: PROMPT CONSTRUCTION (Tạo Prompt)
-    #         template = """Bạn là trợ lý AI hữu ích. Dựa vào ngữ cảnh sau để trả lời câu hỏi.
+    #         # Tạo messages với system + user prompt
+    #         messages = [
+    #             {"role": "system", "content": RAG_SYSTEM_PROMPT},
+    #             {"role": "user", "content": user_prompt}
+    #         ]
             
-    #         Ngữ cảnh:
-    #         {context}
-            
-    #         Câu hỏi: {question}
-    #         """
-    #         prompt_template = ChatPromptTemplate.from_template(template)
-            
-    #         # Thay thế biến {context} và {question} vào template
-    #         # Kết quả 'messages' là một list các object Message (SystemMessage, HumanMessage)
-    #         messages = prompt_template.format_messages(
-    #             context=context_text,
-    #             question=question
-    #         )
-
-    #         # ---> DEBUG: Xem chính xác những gì sắp gửi cho AI
-    #         logger.info(f"--- [STEP 3] Sending Message to AI ---")
-    #         logger.info(f"Prompt content: {messages[0].content[:200]}...") # Log 200 ký tự đầu của prompt
-
-    #         # BƯỚC 4: GENERATION (Gọi AI & Stream)
-    #         # Gọi hàm astream trực tiếp của LLM với danh sách messages đã tạo
+    #         # STEP 4: Stream - Yield NGUYÊN CHUNK TỪ MODEL!
     #         async for chunk in self.llm.astream(messages):
-    #             # chunk ở đây là object AIMessageChunk, ta cần lấy .content
-    #             # content = chunk.content
-    #             # if content:
-    #             #     yield content
-    #             chunk_data = chunk.model_dump()
-    #             yield json.dumps(chunk_data) + "\n"
+    #             # Serialize toàn bộ chunk object (giữ nguyên structure)
+    #             chunk_json = chunk.model_dump()  # hoặc chunk.dict() tùy version
+    #             yield f"data: {json.dumps(chunk_json)}\n\n"
+            
+    #         # Kết thúc stream
+    #         yield "data: [DONE]\n\n"
+            
+    #     except Exception as e:
+    #         logger.error(f"Error: {e}")
+    #         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
+    #     except Exception as e:
+    #         logger.error(f"Error in manual flow: {e}")
+    #         yield f"[SYSTEM_ERROR]: {str(e)}"
+    
     async def query_rag_stream(self, question: str) -> AsyncGenerator[str, None]:
         """
-        Stream response - yield NGUYÊN BẢN từ LLM, không parse!
+        Stream response với trích dẫn nguồn - yield NGUYÊN BẢN từ LLM
         """
         try:
-            # STEP 1: Retrieval
+            # STEP 1: Validate input
+            if not question or not question.strip():
+                raise BadRequestException("Question cannot be empty")
+            
+            # STEP 2: Retrieval - Tìm tài liệu liên quan
             logger.info(f"Searching for: {question}")
-            retriever = self.vector_db.as_retriever(search_kwargs={"k": 4})
-            docs = retriever.invoke(question) 
+            retriever = self.vector_db.as_retriever(search_kwargs={"k": settings.RETRIEVAL_K})
+            docs = retriever.invoke(question)
             
-            # STEP 2: Prepare Context
-            context_text = "\n\n".join([doc.page_content for doc in docs])
+            # STEP 3: Check if found documents
+            if not docs:
+                logger.warning(f"No documents found for: {question}")
+                yield f"data: {json.dumps({'error': 'Không tìm thấy tài liệu liên quan. Vui lòng upload file trước.'}, ensure_ascii=False)}\n\n"
+                return
             
-            # STEP 3: Build Prompt
-            template = """Bạn là một trợ lý AI thông minh, thân thiện và chuyên nghiệp.
+            # DEBUG: Log các docs đã tìm thấy
+            logger.info(f"Found {len(docs)} documents")
+            for i, doc in enumerate(docs, 1):
+                preview = doc.page_content[:100].replace('\n', ' ')
+                page_info = f"Page {doc.metadata.get('page')}" if doc.metadata.get('page') is not None else "(No page)"
+                filename = os.path.basename(doc.metadata.get('source', 'unknown'))
+                logger.info(f"Doc {i}: {filename} - {page_info} - Preview: {preview}...")
             
-            NHIỆM VỤ CỦA BẠN:
-            1. **Giao tiếp xã giao**: Nếu người dùng chào hỏi (ví dụ: "xin chào", "hello"), hỏi thăm sức khỏe, hoặc hỏi bạn là ai -> Hãy trả lời tự nhiên, lịch sự và giới thiệu ngắn gọn bạn là trợ lý ảo hỗ trợ tra cứu tài liệu. KHÔNG cần dùng ngữ cảnh cho phần này.
+            # STEP 4: Build Prompt với citations
+            user_prompt = build_full_prompt(question, docs)
             
-            2. **Trả lời chuyên môn**: Nếu người dùng hỏi về thông tin, quy định, hoặc kiến thức cụ thể -> HÃY SỬ DỤNG THÔNG TIN TRONG [NGỮ CẢNH] BÊN DƯỚI ĐỂ TRẢ LỜI.
-               - Tuyệt đối trung thực với thông tin trong ngữ cảnh.
-               - Nếu thông tin không có trong ngữ cảnh, hãy nói: "Xin lỗi, tôi không tìm thấy thông tin này trong tài liệu hiện có."
+            # Tạo messages với system + user prompt
+            messages = [
+                {"role": "system", "content": RAG_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ]
             
-            ----------------
-            [NGỮ CẢNH ĐƯỢC CUNG CẤP]:
-            {context}
-            ----------------
-            
-            CÂU HỎI CỦA NGƯỜI DÙNG: {question}
-            
-            TRẢ LỜI:"""
-            
-            prompt_template = ChatPromptTemplate.from_template(template)
-            messages = prompt_template.format_messages(
-                context=context_text,
-                question=question
-            )
-            
-            # STEP 4: Stream - Yield NGUYÊN CHUNK TỪ MODEL!
+            # STEP 5: Stream - Yield NGUYÊN CHUNK TỪ MODEL!
             async for chunk in self.llm.astream(messages):
-                # Serialize toàn bộ chunk object (giữ nguyên structure)
-                chunk_json = chunk.model_dump()  # hoặc chunk.dict() tùy version
-                yield f"data: {json.dumps(chunk_json)}\n\n"
+                chunk_json = chunk.model_dump()
+                yield f"data: {json.dumps(chunk_json, ensure_ascii=False)}\n\n"
             
             # Kết thúc stream
             yield "data: [DONE]\n\n"
             
+        except BadRequestException as e:
+            logger.warning(f"Bad request: {e}")
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+            
+        except VectorDBError as e:
+            logger.error(f"Vector DB error: {e}")
+            yield f"data: {json.dumps({'error': 'Database unavailable'}, ensure_ascii=False)}\n\n"
+            
         except Exception as e:
-            logger.error(f"Error: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-        except Exception as e:
-            logger.error(f"Error in manual flow: {e}")
-            yield f"[SYSTEM_ERROR]: {str(e)}"
+            logger.error(f"Unexpected error in query_rag_stream: {e}", exc_info=True)
+            yield f"data: {json.dumps({'error': 'Server error'}, ensure_ascii=False)}\n\n"
 
    
     def get_sources(self, question: str) -> List[dict]:
@@ -251,7 +240,7 @@ class RagService:
         Get metadata source for UI
         """
         try:
-            retriever = self.vector_db.as_retriever(search_kwargs={"k": 3})
+            retriever = self.vector_db.as_retriever(search_kwargs={"k": settings.RETRIEVAL_K_SOURCES})
             docs = retriever.invoke(question)
             return [
                 {
@@ -272,5 +261,168 @@ class RagService:
             return {"status": "Database cleared"}
         except Exception as e:
             raise VectorDBError(str(e))
+
+    # ============= DOCUMENT MANAGEMENT METHODS =============
+
+    def get_all_documents(self) -> dict:
+        """
+        Lấy danh sách tất cả tài liệu từ Vector DB
+        
+        Returns:
+            {
+                "total": int,  # Số lượng files
+                "total_chunks": int,  # Tổng số chunks
+                "documents": List[dict]  # Danh sách documents
+            }
+        """
+        try:
+            # Lấy tất cả documents từ Chroma
+            collection = self.vector_db._collection
+            results = collection.get()
+            
+            if not results or not results.get('ids'):
+                logger.info("No documents found in database")
+                return {
+                    "total": 0,
+                    "total_chunks": 0,
+                    "documents": []
+                }
+            
+            # Group by source để tránh duplicate (mỗi file có nhiều chunks)
+            documents_map = {}
+            
+            for doc_id, metadata, content in zip(
+                results['ids'],
+                results['metadatas'],
+                results['documents']
+            ):
+                source = metadata.get('source', 'unknown')
+                filename = os.path.basename(source)
+                
+                if filename not in documents_map:
+                    # Tạo preview từ chunk đầu tiên
+                    preview = content[:200].replace('\n', ' ').strip()
+                    if len(content) > 200:
+                        preview += "..."
+                    
+                    documents_map[filename] = {
+                        "id": doc_id,  # ID của chunk đầu tiên
+                        "filename": filename,
+                        "source": source,
+                        "page": metadata.get('page'),
+                        "preview": preview,
+                        "chunk_count": 1
+                    }
+                else:
+                    # Tăng chunk count
+                    documents_map[filename]["chunk_count"] += 1
+            
+            # Convert to list và sort
+            documents_list = sorted(
+                documents_map.values(),
+                key=lambda x: x['filename']
+            )
+            
+            logger.info(f"Retrieved {len(documents_list)} unique documents with {len(results['ids'])} total chunks")
+            
+            return {
+                "total": len(documents_list),
+                "total_chunks": len(results['ids']),
+                "documents": documents_list
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get all documents: {e}", exc_info=True)
+            raise VectorDBError(f"Failed to retrieve documents: {str(e)}")
+
+    def search_documents_by_filename(self, filename: str) -> List[dict]:
+        """
+        Tìm kiếm tài liệu theo tên file (partial match)
+        
+        Args:
+            filename: Tên file cần tìm
+            
+        Returns:
+            List[dict]: Danh sách documents khớp
+        """
+        try:
+            all_docs_result = self.get_all_documents()
+            all_docs = all_docs_result["documents"]
+            
+            # Filter theo filename (case-insensitive)
+            filtered = [
+                doc for doc in all_docs 
+                if filename.lower() in doc['filename'].lower()
+            ]
+            
+            logger.info(f"Found {len(filtered)} documents matching '{filename}'")
+            return filtered
+            
+        except Exception as e:
+            logger.error(f"Search failed: {e}", exc_info=True)
+            raise VectorDBError(f"Search failed: {str(e)}")
+
+    def delete_document_by_source(self, filename: str) -> int:
+        """
+        Xóa TẤT CẢ chunks của 1 file khỏi Vector DB
+        
+        Args:
+            filename: Tên file cần xóa
+            
+        Returns:
+            int: Số chunks đã xóa
+        """
+        try:
+            collection = self.vector_db._collection
+            results = collection.get()
+            
+            if not results or not results.get('ids'):
+                logger.warning("No documents in database")
+                return 0
+            
+            # Tìm tất cả IDs của file cần xóa
+            ids_to_delete = []
+            
+            for doc_id, metadata in zip(results['ids'], results['metadatas']):
+                source = metadata.get('source', 'unknown')
+                current_filename = os.path.basename(source)
+                
+                if current_filename == filename:
+                    ids_to_delete.append(doc_id)
+            
+            if not ids_to_delete:
+                logger.warning(f"Document '{filename}' not found")
+                return 0
+            
+            # Xóa tất cả chunks của file
+            collection.delete(ids=ids_to_delete)
+            
+            logger.info(f"Deleted {len(ids_to_delete)} chunks of document '{filename}'")
+            return len(ids_to_delete)
+            
+        except Exception as e:
+            logger.error(f"Failed to delete document '{filename}': {e}", exc_info=True)
+            raise VectorDBError(f"Failed to delete document: {str(e)}")
+
+    def get_database_stats(self) -> dict:
+        """
+        Lấy thống kê về vector database
+        
+        Returns:
+            dict: Thông tin thống kê
+        """
+        try:
+            all_docs_result = self.get_all_documents()
+            
+            return {
+                "total_files": all_docs_result["total"],
+                "total_chunks": all_docs_result["total_chunks"],
+                "storage_path": settings.VECTOR_DB_PATH,
+                "embedding_model": "models/text-embedding-004"
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get statistics: {e}", exc_info=True)
+            raise VectorDBError(f"Failed to get statistics: {str(e)}")
 
 rag_service = RagService()
