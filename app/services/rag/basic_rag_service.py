@@ -17,6 +17,7 @@ from app.core.config import settings
 from app.core.llm import llm
 from app.core.exceptions import VectorDBError, BadRequestException
 from app.core.prompt.prompts import RAG_SYSTEM_PROMPT, build_full_prompt
+from app.services.rag.pdf_highlighter import PDFHighlighter
 
 logger = logging.getLogger(__name__)
 
@@ -104,15 +105,22 @@ class BasicRagService:
         except Exception as e:
             raise VectorDBError(f"Ingestion failed: {str(e)}")
     
-    async def query_rag_stream(self, question: str) -> AsyncGenerator[str, None]:
+    async def query_rag_stream(self, question: str, request=None) -> AsyncGenerator[str, None]:
         """
-        Main Logic: Retrieve -> Stream Answer -> Return Sources.
+        Main Logic: Retrieve -> Stream Answer -> Return Sources with Highlights.
+        
+        Highlight Extraction Process:
+        1. After retrieving chunks from vector DB
+        2. For each chunk, locate its exact position in the original PDF
+        3. Use PDFHighlighter to extract bounding box coordinates
+        4. Convert to percentage-based coordinates for react-pdf-viewer
+        5. Return highlights array with each source
         """
         try:
             if not question.strip():
                 raise BadRequestException("Empty question")
             
-            # 1. Retrieve
+            # 1. Retrieve documents from vector DB
             retriever = self.vector_db.as_retriever(search_kwargs={"k": settings.RETRIEVAL_K})
             docs = retriever.invoke(question)
             
@@ -121,34 +129,92 @@ class BasicRagService:
                 yield "data: [DONE]\n\n"
                 return
             
-            # 2. Prepare Sources (Simplified - No Bounding Boxes/Positions)
-            sources = []
+            # 2. Group documents by source file for efficient highlight extraction
+            docs_by_source = {}
             for idx, doc in enumerate(docs):
                 source_path = doc.metadata.get("source", "")
-                page_num = doc.metadata.get("page", 1)
-                filename = os.path.basename(source_path) if source_path else "unknown"
-                
-                sources.append({
-                    "content": {"text": doc.page_content},
-                    "id": f"{idx}_{page_num}",
-                    "source": filename,
-                    "page": page_num,
-                    "position": None # Removed complex calculation logic
+                if source_path not in docs_by_source:
+                    docs_by_source[source_path] = []
+                docs_by_source[source_path].append({
+                    "idx": idx,
+                    "doc": doc,
+                    "page": doc.metadata.get("page", 1)
                 })
             
-            # 3. Build Prompt & Messages
+            # 3. Extract highlights for each source file
+            all_sources = []
+            
+            for source_path, doc_list in docs_by_source.items():
+                filename = os.path.basename(source_path) if source_path else "unknown"
+                
+                # Build base URL for static file serving
+                base_url = ""
+                if request:
+                    base_url = str(request.base_url).rstrip("/")
+                
+                # Check if source is a PDF and extract highlights
+                highlights = []
+                if source_path and source_path.endswith(".pdf") and os.path.exists(source_path):
+                    try:
+                        # Prepare chunks for highlight extraction
+                        chunks_for_highlight = [
+                            {
+                                "id": f"{item['idx']}_{item['page']}",
+                                "text": item["doc"].page_content,
+                                "page": item["page"]
+                            }
+                            for item in doc_list
+                        ]
+                        
+                        # Extract highlights using PDFHighlighter
+                        with PDFHighlighter(source_path) as highlighter:
+                            chunk_highlights = highlighter.find_all_highlights(chunks_for_highlight)
+                            
+                            # Flatten all highlight areas
+                            for ch in chunk_highlights:
+                                for area in ch.areas:
+                                    highlights.append({
+                                        "pageIndex": area.pageIndex,
+                                        "left": round(area.left, 4),
+                                        "top": round(area.top, 4),
+                                        "width": round(area.width, 4),
+                                        "height": round(area.height, 4)
+                                    })
+                    except Exception as e:
+                        logger.error(f"Highlight extraction failed for {source_path}: {e}")
+                        # Continue without highlights if extraction fails
+                
+                # Build source entries for each document in this file
+                for item in doc_list:
+                    doc = item["doc"]
+                    page_num = item["page"]
+                    idx = item["idx"]
+                    
+                    # Filter highlights for this specific page
+                    page_highlights = [h for h in highlights if h["pageIndex"] == page_num - 1]
+                    
+                    all_sources.append({
+                        "id": f"{idx}_{page_num}",
+                        "content": {"text": doc.page_content},
+                        "source": filename,
+                        "url": f"{base_url}/static/{filename}" if base_url else f"/static/{filename}",
+                        "page": page_num,
+                        "highlights": page_highlights if page_highlights else highlights  # All highlights if no page-specific
+                    })
+            
+            # 4. Build Prompt & Messages
             user_prompt = build_full_prompt(question, docs)
             messages = [
                 {"role": "system", "content": RAG_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ]
             
-            # 4. Stream LLM Response
+            # 5. Stream LLM Response
             async for chunk in self.llm.astream(messages):
                 yield f"data: {json.dumps({'content': chunk.model_dump()}, ensure_ascii=False)}\n\n"
             
-            # 5. Send Sources
-            yield f"data: {json.dumps({'sources': sources}, ensure_ascii=False)}\n\n"
+            # 6. Send Sources with Highlights
+            yield f"data: {json.dumps({'sources': all_sources}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             
         except Exception as e:
