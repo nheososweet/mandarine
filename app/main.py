@@ -4,7 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-
+from fastapi.staticfiles import StaticFiles
+import os
 # Import Config & Router
 from app.core.config import settings
 from app.api.v1.router import api_router
@@ -63,6 +64,18 @@ def get_application() -> FastAPI:
     return application
 
 app = get_application()
+
+UPLOAD_DIR = "app/uploads"
+
+# Tạo folder nếu chưa tồn tại
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Public folder
+app.mount(
+    "/uploads",
+    StaticFiles(directory=UPLOAD_DIR),
+    name="uploads",
+)
 
 @app.get("/", tags=["Health Check"])
 def root():

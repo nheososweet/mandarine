@@ -1,15 +1,18 @@
 import os
 import shutil
 import logging
-from typing import List, AsyncGenerator
+from typing import List, AsyncGenerator, Dict, Any
 import json
+import fitz  # PyMuPDF
+from langchain_core.documents import Document
+
 # --- Latest LangChain Core Imports ---
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 
 # --- Community Imports ---
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
+from langchain_community.document_loaders import Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
@@ -54,26 +57,216 @@ class RagService:
             logger.critical(f"RAG Service Init Failed: {e}")
             raise VectorDBError(f"System Initialization Error: {str(e)}")
 
+    def _clean_text_for_matching(self, text: str) -> str:
+        """
+        Clean and normalize text for better matching accuracy.
+        Removes extra whitespace, special chars, and normalizes encoding.
+        
+        Args:
+            text: Raw text from PDF or vector DB
+            
+        Returns:
+            Cleaned and normalized text
+        """
+        if not text:
+            return ""
+        
+        # 1. Normalize unicode characters (Vietnamese accents, etc.)
+        import unicodedata
+        text = unicodedata.normalize('NFKC', text)
+        
+        # 2. Replace multiple whitespaces/newlines with single space
+        import re
+        text = re.sub(r'\s+', ' ', text)
+        
+        # 3. Remove zero-width spaces and other invisible chars
+        text = re.sub(r'[\u200b-\u200f\u2060\ufeff]', '', text)
+        
+        # 4. Strip leading/trailing whitespace
+        text = text.strip()
+        
+        # 5. Normalize punctuation (remove excessive spaces around punctuation)
+        text = re.sub(r'\s*([,.:;!?])\s*', r'\1 ', text)
+        
+        # 6. Remove soft hyphens and other PDF artifacts
+        text = text.replace('\u00ad', '')  # Soft hyphen
+        text = text.replace('\ufeff', '')  # BOM
+        
+        return text.lower()
+
+    def _extract_pdf_text_only(self, file_path: str) -> List[Document]:
+        """
+        Extract text from PDF using PyMuPDF (without bbox).
+        Used for ingestion - returns page-level documents.
+        
+        Args:
+            file_path: Path to PDF file
+            
+        Returns:
+            List of Document objects (one per page)
+        """
+        documents = []
+        
+        try:
+            pdf_document = fitz.open(file_path)
+            
+            for page_num in range(len(pdf_document)):
+                page = pdf_document[page_num]
+                text = page.get_text()
+                
+                if text.strip():  # Only add non-empty pages
+                    doc = Document(
+                        page_content=text,
+                        metadata={
+                            "source": file_path,
+                            "page": page_num + 1  # 1-indexed for consistency
+                        }
+                    )
+                    documents.append(doc)
+            
+            pdf_document.close()
+            logger.info(f"Extracted {len(documents)} pages from {os.path.basename(file_path)}")
+            return documents
+            
+        except Exception as e:
+            logger.error(f"PyMuPDF extraction error for {file_path}: {e}")
+            raise FileProcessingError(f"Failed to extract PDF: {str(e)}")
+
+    def _find_text_bbox_in_pdf(self, file_path: str, search_text: str, page_num: int) -> List[Dict[str, Any]]:
+        """
+        Search for text in a specific PDF page and return bounding boxes.
+        
+        Args:
+            file_path: Path to PDF file
+            search_text: Text to search for (can be chunk text)
+            page_num: Page number (1-indexed)
+            
+        Returns:
+            List of bbox dicts matching the text
+        """
+        try:
+            pdf_document = fitz.open(file_path)
+            
+            # Validate page number (1-indexed)
+            if page_num < 1 or page_num > len(pdf_document):
+                logger.warning(f"Invalid page number {page_num} for {file_path}")
+                return []
+            
+            page = pdf_document[page_num - 1]  # Convert to 0-indexed for PyMuPDF
+            page_rect = page.rect
+            
+            # Extract ALL text blocks from the page with their bboxes
+            blocks = page.get_text("blocks")
+            
+            # CLEAN search text for better matching
+            search_cleaned = self._clean_text_for_matching(search_text[:300])
+            
+            matched_bboxes = []
+            all_text_blocks = []  # Collect all blocks for fallback
+            
+            logger.info(f"Cleaned search text (first 100 chars): {search_cleaned[:100]}")
+            
+            # Try to find blocks that contain the search text
+            for block in blocks:
+                if len(block) >= 5:
+                    block_text_raw = block[4].strip()
+                    
+                    if not block_text_raw:  # Skip empty blocks
+                        continue
+                    
+                    # CLEAN block text
+                    block_text_cleaned = self._clean_text_for_matching(block_text_raw)
+                    
+                    x0, y0, x1, y1 = block[:4]
+                    bbox = {
+                        "x1": float(x0),
+                        "y1": float(y0),
+                        "x2": float(x1),
+                        "y2": float(y1),
+                        "width": float(page_rect.width),
+                        "height": float(page_rect.height),
+                        "pageNumber": page_num
+                    }
+                    all_text_blocks.append(bbox)
+                    
+                    # MATCHING với cleaned text
+                    # Strategy 1: Direct substring match
+                    if search_cleaned in block_text_cleaned or block_text_cleaned in search_cleaned:
+                        matched_bboxes.append(bbox)
+                        logger.info(f"✓ Matched block (substring): {block_text_cleaned[:50]}...")
+                        continue
+                    
+                    # Strategy 2: Fuzzy match on first 150 chars
+                    if self._fuzzy_match(search_cleaned[:150], block_text_cleaned[:150]):
+                        matched_bboxes.append(bbox)
+                        logger.info(f"✓ Matched block (fuzzy): {block_text_cleaned[:50]}...")
+            
+            pdf_document.close()
+            
+            # FALLBACK: If no specific match, return all text blocks on page
+            if not matched_bboxes and all_text_blocks:
+                logger.warning(f"No exact match found, returning {len(all_text_blocks)} blocks from page {page_num}")
+                return all_text_blocks[:5]  # Return first 5 blocks as representative sample
+            
+            return matched_bboxes
+            
+        except Exception as e:
+            logger.error(f"Error finding bbox in {file_path}: {e}")
+            return []
+    
+    def _fuzzy_match(self, text1: str, text2: str, threshold: float = 0.3) -> bool:
+        """
+        Check if two texts have significant overlap.
+        
+        Args:
+            text1: First text
+            text2: Second text
+            threshold: Minimum ratio to consider match (0-1) - default 0.3 (30%)
+            
+        Returns:
+            True if texts overlap significantly
+        """
+        if not text1 or not text2:
+            return False
+        
+        # Split into words
+        words1 = set(text1.split())
+        words2 = set(text2.split())
+        
+        if not words1 or not words2:
+            return False
+        
+        # Calculate Jaccard similarity
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        
+        similarity = intersection / union if union > 0 else 0
+        return similarity >= threshold
+
     async def ingest_files(self, files: List[any]) -> dict:
         """
-        Flow: Upload -> Save Temp -> Load -> Split -> Embed -> Store
+        Flow: Upload -> Save Permanent -> Load -> Split -> Embed -> Store
         """
         if not files:
             raise BadRequestException("No files uploaded")
 
         documents = []
         errors = []
-        temp_dir = "temp_ingest_uploads"
-        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Use permanent upload directory
+        permanent_dir = "uploads"
+        os.makedirs(permanent_dir, exist_ok=True)
 
         try:
             for file in files:
-                file_path = os.path.join(temp_dir, file.filename)
+                # Save to permanent location
+                permanent_path = os.path.join(permanent_dir, file.filename)
                 
-                # Save file to disk
+                # Save file to disk (permanent)
                 try:
-                    with open(file_path, "wb") as buffer:
+                    with open(permanent_path, "wb") as buffer:
                         shutil.copyfileobj(file.file, buffer)
+                    logger.info(f"Saved {file.filename} to {permanent_path}")
                 except Exception as e:
                     logger.error(f"Save file error {file.filename}: {e}")
                     errors.append(f"{file.filename}: Save failed")
@@ -82,18 +275,23 @@ class RagService:
                 # Load logic
                 try:
                     if file.filename.endswith(".pdf"):
-                        loader = PyPDFLoader(file_path)
+                        # Use PyMuPDF for PDF extraction
+                        docs = self._extract_pdf_text_only(permanent_path)
                     elif file.filename.endswith(".docx"):
-                        loader = Docx2txtLoader(file_path)
+                        loader = Docx2txtLoader(permanent_path)
+                        docs = loader.load()
                     else:
                         logger.warning(f"Skipping {file.filename}")
                         continue
                     
-                    # Load content
-                    docs = loader.load()
+                    # Validate content
                     if not docs:
                         logger.warning(f"Empty file: {file.filename}")
                         continue
+                    
+                    # Update metadata with absolute path for later bbox search
+                    for doc in docs:
+                        doc.metadata["source"] = os.path.abspath(permanent_path)
                         
                     documents.extend(docs)
 
@@ -129,11 +327,6 @@ class RagService:
         except Exception as e:
             if isinstance(e, FileProcessingError): raise e
             raise VectorDBError(f"Ingestion failed: {str(e)}")
-        
-        finally:
-            # Cleanup temp files
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
 
     # async def query_rag_stream(self, question: str) -> AsyncGenerator[str, None]:
     #     """
@@ -179,60 +372,116 @@ class RagService:
     
     async def query_rag_stream(self, question: str) -> AsyncGenerator[str, None]:
         """
-        Stream response với trích dẫn nguồn - yield NGUYÊN BẢN từ LLM
+        Stream response with citations - yielding raw LLM chunks and final sources.
         """
         try:
             # STEP 1: Validate input
             if not question or not question.strip():
                 raise BadRequestException("Question cannot be empty")
             
-            # STEP 2: Retrieval - Tìm tài liệu liên quan
+            # STEP 2: Retrieval - Find relevant documents
             logger.info(f"Searching for: {question}")
             retriever = self.vector_db.as_retriever(search_kwargs={"k": settings.RETRIEVAL_K})
             docs = retriever.invoke(question)
             
-            # STEP 3: Check if found documents
+            # STEP 3: Check if documents were found
             if not docs:
                 logger.warning(f"No documents found for: {question}")
+                # Send an informative message to the client and stop
                 yield f"data: {json.dumps({'error': 'Không tìm thấy tài liệu liên quan. Vui lòng upload file trước.'}, ensure_ascii=False)}\n\n"
+                yield f"data: [DONE]\n\n"
                 return
             
-            # DEBUG: Log các docs đã tìm thấy
-            logger.info(f"Found {len(docs)} documents")
-            for i, doc in enumerate(docs, 1):
-                preview = doc.page_content[:100].replace('\n', ' ')
-                page_info = f"Page {doc.metadata.get('page')}" if doc.metadata.get('page') is not None else "(No page)"
-                filename = os.path.basename(doc.metadata.get('source', 'unknown'))
-                logger.info(f"Doc {i}: {filename} - {page_info} - Preview: {preview}...")
+            # PREPARE SOURCES - Format tương thích với FE Mark.js
+            sources = []
+            for idx, doc in enumerate(docs):
+                # Get source file path
+                source_path = doc.metadata.get("source", "")
+                page_num = doc.metadata.get("page", 1)
+                text_content = doc.page_content
+                
+                # Debug logging
+                logger.info(f"Processing doc {idx}: source={source_path}, page={page_num}, exists={os.path.exists(source_path)}")
+                
+                # Search for text bbox in PDF on-the-fly
+                bboxes = []
+                if source_path and source_path.endswith(".pdf") and os.path.exists(source_path):
+                    # Use the full chunk text for matching (up to 500 chars for context)
+                    search_text = text_content[:500].strip()
+                    logger.info(f"Doc {idx}: Searching with {len(search_text)} chars")
+                    bboxes = self._find_text_bbox_in_pdf(source_path, search_text, page_num)
+                    
+                    if bboxes:
+                        logger.info(f"✓ Doc {idx}: Found {len(bboxes)} bboxes")
+                    else:
+                        logger.warning(f"✗ Doc {idx}: No bbox found on page {page_num}")
+                else:
+                    logger.warning(f"Cannot search bbox: path={source_path}, exists={os.path.exists(source_path) if source_path else False}")
+                
+                # Get filename
+                filename = os.path.basename(source_path) if source_path else "unknown"
+                
+                # Use first bbox if found, otherwise None
+                bbox = bboxes[0] if bboxes else None
+                
+                # Format matching FE TypeScript interface exactly
+                source_entry = {
+                    "content": {
+                        "text": text_content
+                    },
+                    "position": {
+                        "boundingRect": bbox,
+                        "rects": bboxes,
+                        "pageNumber": page_num
+                    } if bboxes else None,
+                    "comment": {
+                        "text": "",
+                        "emoji": ""
+                    },
+                    "id": f"{page_num}_{idx}_{hash(text_content) & 0xFFFFFFFF}",
+                    # Additional metadata
+                    "source": filename,
+                    "page": page_num
+                }
+                
+                sources.append(source_entry)
             
-            # STEP 4: Build Prompt với citations
+            # STEP 4: Build Prompt with citations
             user_prompt = build_full_prompt(question, docs)
             
-            # Tạo messages với system + user prompt
             messages = [
                 {"role": "system", "content": RAG_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ]
             
-            # STEP 5: Stream - Yield NGUYÊN CHUNK TỪ MODEL!
+            # STEP 5: Stream - Yield raw chunks from the model
             async for chunk in self.llm.astream(messages):
                 chunk_json = chunk.model_dump()
-                yield f"data: {json.dumps(chunk_json, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'content': chunk_json}, ensure_ascii=False)}\n\n"
             
-            # Kết thúc stream
+            # STEP 6: Send the sources in the final chunk
+            final_payload = {
+                "sources": sources
+            }
+            yield f"data: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
+
+            # STEP 7: End the stream
             yield "data: [DONE]\n\n"
             
         except BadRequestException as e:
             logger.warning(f"Bad request: {e}")
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
             
         except VectorDBError as e:
             logger.error(f"Vector DB error: {e}")
             yield f"data: {json.dumps({'error': 'Database unavailable'}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
             
         except Exception as e:
             logger.error(f"Unexpected error in query_rag_stream: {e}", exc_info=True)
             yield f"data: {json.dumps({'error': 'Server error'}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
 
    
     def get_sources(self, question: str) -> List[dict]:
@@ -246,7 +495,7 @@ class RagService:
                 {
                     "source": os.path.basename(doc.metadata.get("source", "unknown")),
                     "page": doc.metadata.get("page", 0),
-                    "preview": doc.page_content[:100] + "..."
+                    "content": doc.page_content
                 } for doc in docs
             ]
         except Exception as e:
