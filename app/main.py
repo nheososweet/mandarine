@@ -65,12 +65,21 @@ def get_application() -> FastAPI:
 
 app = get_application()
 
-UPLOAD_DIR = "app/uploads"
+# Persistent uploads directory for PDFs
+PERSISTENT_UPLOAD_DIR = "persistent_uploads"
+os.makedirs(PERSISTENT_UPLOAD_DIR, exist_ok=True)
 
-# Tạo folder nếu chưa tồn tại
+# Regular uploads directory
+UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Public folder
+# Mount static files for PDF viewing
+app.mount(
+    "/static",
+    StaticFiles(directory=PERSISTENT_UPLOAD_DIR),
+    name="static",
+)
+
 app.mount(
     "/uploads",
     StaticFiles(directory=UPLOAD_DIR),

@@ -46,12 +46,13 @@ class BasicRagService:
     async def ingest_files(self, files: List[any]) -> dict:
         """
         Main Logic: Upload -> Read File -> Split -> Embed -> Store.
+        Save PDFs to persistent_uploads for later access.
         """
         if not files:
             raise BadRequestException("No files uploaded")
 
         documents = []
-        permanent_dir = "uploads"
+        permanent_dir = "persistent_uploads"
         os.makedirs(permanent_dir, exist_ok=True)
 
         try:
@@ -123,7 +124,7 @@ class BasicRagService:
             # 1. Retrieve documents from vector DB
             retriever = self.vector_db.as_retriever(search_kwargs={"k": settings.RETRIEVAL_K})
             docs = retriever.invoke(question)
-            
+            print(f"Retrieved docs: {docs}")
             if not docs:
                 yield f"data: {json.dumps({'error': 'No documents found'}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -143,6 +144,8 @@ class BasicRagService:
             
             # 3. Extract highlights for each source file
             all_sources = []
+            all_highlights_by_file = {}  # Map filename -> all highlights for that file
+            retrieved_chunks = []  # Store all retrieved text chunks for raw display
             
             for source_path, doc_list in docs_by_source.items():
                 filename = os.path.basename(source_path) if source_path else "unknown"
@@ -152,8 +155,9 @@ class BasicRagService:
                 if request:
                     base_url = str(request.base_url).rstrip("/")
                 
+                file_url = f"{base_url}/static/{filename}" if base_url else f"/static/{filename}"
+                
                 # Check if source is a PDF and extract highlights
-                highlights = []
                 if source_path and source_path.endswith(".pdf") and os.path.exists(source_path):
                     try:
                         # Prepare chunks for highlight extraction
@@ -170,19 +174,24 @@ class BasicRagService:
                         with PDFHighlighter(source_path) as highlighter:
                             chunk_highlights = highlighter.find_all_highlights(chunks_for_highlight)
                             
-                            # Flatten all highlight areas
+                            # Collect all highlight areas for this file
+                            file_highlights = []
                             for ch in chunk_highlights:
                                 for area in ch.areas:
-                                    highlights.append({
+                                    file_highlights.append({
                                         "pageIndex": area.pageIndex,
                                         "left": round(area.left, 4),
                                         "top": round(area.top, 4),
                                         "width": round(area.width, 4),
                                         "height": round(area.height, 4)
                                     })
+                            
+                            # Store highlights for this file
+                            if file_highlights:
+                                all_highlights_by_file[file_url] = file_highlights
+                                
                     except Exception as e:
                         logger.error(f"Highlight extraction failed for {source_path}: {e}")
-                        # Continue without highlights if extraction fails
                 
                 # Build source entries for each document in this file
                 for item in doc_list:
@@ -190,16 +199,20 @@ class BasicRagService:
                     page_num = item["page"]
                     idx = item["idx"]
                     
-                    # Filter highlights for this specific page
-                    page_highlights = [h for h in highlights if h["pageIndex"] == page_num - 1]
+                    # Store chunk for raw display
+                    retrieved_chunks.append({
+                        "id": f"{idx}_{page_num}",
+                        "text": doc.page_content,
+                        "source": filename,
+                        "page": page_num
+                    })
                     
                     all_sources.append({
                         "id": f"{idx}_{page_num}",
                         "content": {"text": doc.page_content},
                         "source": filename,
-                        "url": f"{base_url}/static/{filename}" if base_url else f"/static/{filename}",
-                        "page": page_num,
-                        "highlights": page_highlights if page_highlights else highlights  # All highlights if no page-specific
+                        "url": file_url,
+                        "page": page_num
                     })
             
             # 4. Build Prompt & Messages
@@ -213,8 +226,17 @@ class BasicRagService:
             async for chunk in self.llm.astream(messages):
                 yield f"data: {json.dumps({'content': chunk.model_dump()}, ensure_ascii=False)}\n\n"
             
-            # 6. Send Sources with Highlights
+            # 6. Send Sources (without highlights)
             yield f"data: {json.dumps({'sources': all_sources}, ensure_ascii=False)}\n\n"
+            
+            # 7. Send Highlights and Retrieved Chunks separately in the last chunk (doesn't affect streaming UX)
+            if all_highlights_by_file:
+                yield f"data: {json.dumps({'highlights': all_highlights_by_file}, ensure_ascii=False)}\n\n"
+            
+            # 8. Send Retrieved Chunks for raw text display
+            if retrieved_chunks:
+                yield f"data: {json.dumps({'retrievedChunks': retrieved_chunks}, ensure_ascii=False)}\n\n"
+            
             yield "data: [DONE]\n\n"
             
         except Exception as e:
