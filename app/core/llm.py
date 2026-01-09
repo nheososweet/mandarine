@@ -2,7 +2,7 @@ from langchain_openai import ChatOpenAI
 from app.core.config import settings
 
 llm = ChatOpenAI(
-    model="openai/gpt-oss-20b",
+    model="cyankiwi/Qwen3-Omni-30B-A3B-Thinking-AWQ-4bit",
     stream_usage=True,
     # temperature=None,
     # max_tokens=None,

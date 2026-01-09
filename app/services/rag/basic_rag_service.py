@@ -17,7 +17,8 @@ from app.core.config import settings
 from app.core.llm import llm
 from app.core.exceptions import VectorDBError, BadRequestException
 from app.core.prompt.prompts import RAG_SYSTEM_PROMPT, build_full_prompt
-from app.services.rag.pdf_highlighter import PDFHighlighter
+# from app.services.rag.pdf_highlighter import PDFHighlighter
+from app.services.rag.enhanced_highlighter import EnhancedPDFHighlighter
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,7 @@ class BasicRagService:
                         ]
                         
                         # Extract highlights using PDFHighlighter
-                        with PDFHighlighter(source_path) as highlighter:
+                        with EnhancedPDFHighlighter(source_path) as highlighter:
                             chunk_highlights = highlighter.find_all_highlights(chunks_for_highlight)
                             
                             # Collect all highlight areas for this file

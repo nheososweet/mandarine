@@ -155,12 +155,37 @@ class PDFHighlighter:
                                 page_height=page_height
                             ))
     
+    # def _normalize_text(self, text: str) -> str:
+    #     """
+    #     Normalize text for matching: lowercase, collapse whitespace.
+    #     """
+    #     text = text.lower()
+    #     text = re.sub(r'\s+', ' ', text)
+    #     return text.strip()
+    
     def _normalize_text(self, text: str) -> str:
         """
-        Normalize text for matching: lowercase, collapse whitespace.
+        Normalize text: lowercase, collapse whitespace, and FIX BROKEN VIETNAMESE WORDS.
         """
         text = text.lower()
+        
+        # --- FIX 1: Nối các từ tiếng Việt bị vỡ (Quan trọng nhất) ---
+        # Regex này tìm: [Khoảng trắng] + [Nguyên âm có dấu hoặc các ký tự đặc biệt của tiếng Việt]
+        # Ví dụ: "t ừ" -> "từ", "ti ền" -> "tiền", "s ẽ" -> "sẽ"
+        # Các ký tự cần bắt: àáảãạ... (và cả các phụ âm ghép nếu cần, nhưng chủ yếu vỡ ở nguyên âm)
+        
+        # List các nguyên âm/ký tự thường bị tách rời:
+        # à, á, ả, ã, ạ, ... ư, ứ, ...
+        # Logic: Nếu thấy 1 ký tự có dấu đứng lẻ loi sau dấu cách, nối nó vào từ trước đó.
+        
+        text = re.sub(r'(?<=[a-zA-Z])\s+([àáảãạâầấẩẫậăằắẳẵặèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ])', r'\1', text)
+        
+        # --- FIX 2: Xóa các ký tự nhiễu (Zero-width space, etc) ---
+        text = text.replace('\u200b', '').replace('\ufeff', '')
+
+        # Chuẩn hóa khoảng trắng
         text = re.sub(r'\s+', ' ', text)
+        
         return text.strip()
     
     def _tokenize(self, text: str) -> List[str]:
@@ -168,7 +193,9 @@ class PDFHighlighter:
         Tokenize text into words for matching.
         Uses simple word boundary splitting.
         """
-        return re.findall(r'\b\w+\b', text.lower())
+        # return re.findall(r'\b\w+\b', text.lower())
+        normalized_text = self._normalize_text(text)
+        return re.findall(r'\b\w+\b', normalized_text)
     
     def _find_matching_blocks(self, chunk_text: str, page_hint: Optional[int] = None) -> List[PDFTextBlock]:
         """
